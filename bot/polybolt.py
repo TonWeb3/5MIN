@@ -149,12 +149,17 @@ def _num(v: Any) -> Optional[float]:
 
 
 def _point(p: Any, fallback_ts: Any) -> Optional[Tuple[float, float]]:
-    """(unix seconds, price) from one point; the exact full_accuracy_value first."""
+    """(unix seconds, price) from one point; use full_accuracy_value only when it agrees with value."""
     if not isinstance(p, dict):
         return None
-    value = _num(p.get("full_accuracy_value"))
-    if value is None:
-        value = _num(p.get("value"))
+    coarse = _num(p.get("value"))
+    fine = _num(p.get("full_accuracy_value"))
+    if fine is not None and coarse is not None:
+        # Guard against 1e18 fixed-point or schema mismatch: only trust full_accuracy_value
+        # when it agrees closely with human-scaled `value`.
+        value = fine if abs(fine - coarse) <= max(1e-6, abs(coarse) * 1e-3) else coarse
+    else:
+        value = fine if fine is not None else coarse
     ts = _num(p.get("timestamp"))
     if ts is None:
         ts = _num(fallback_ts)

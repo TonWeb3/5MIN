@@ -1,4 +1,4 @@
-from typing import List, Optional, Dict, Tuple
+from typing import List, Optional, Dict
 import rust_clob
 
 # Below this many minutes left the horizon is treated as effectively settled
@@ -14,17 +14,6 @@ def realized_drift_vol(candles: List[Dict], lookback: int = 300):
     if len(closes) < 20:
         return None, None
     return rust_clob.compute_realized_drift_vol(closes, lookback)
-
-
-def adaptive_vol(candles: List[Dict], lookback: int = 300,
-                 half_life: float = 15.0) -> Tuple[Optional[float], Optional[float]]:
-    """Fast EWMA 1m volatility blended with the baseline (zero-mean, drift = 0).
-    Returns (sigma_blended, sigma_ewma).
-    Executed natively via Rust `compute_ewma_vol` with ZERO Python fallback."""
-    closes = [float(c["close"]) for c in candles[-lookback:] if c.get("close")]
-    if len(closes) < 20:
-        return None, None
-    return rust_clob.compute_ewma_vol(closes, float(half_life), int(lookback))
 
 
 def fair_prob_up(current_price: float, strike: float, minutes_left: float,

@@ -7,14 +7,11 @@ import rust_clob
 from .config import settings
 from .net_utils import get_proxy_url_for
 
-
 class BinanceTradeStream:
-    """Fast spot-price & aggressor-flow feed from Binance @trade — native Rust only, ZERO Python fallback."""
-    def __init__(self, symbol: str, on_update: Optional[Callable] = None,
-                 on_event: Optional[Callable[[], None]] = None):
+    """Fast spot-price feed from Binance @trade — the leading signal for fair_prob."""
+    def __init__(self, symbol: str, on_update: Optional[Callable] = None):
         self.symbol = symbol.lower()
         self.on_update = on_update
-        self.on_event = on_event
         self.last_price = None
         self.last_ts = None
         self.closed = False
@@ -34,9 +31,9 @@ class BinanceTradeStream:
                         while not self.closed:
                             msg = await ws.receive()
                             if msg.type == aiohttp.WSMsgType.TEXT:
-                                parsed = rust_clob.fast_parse_binance_trade_flow(msg.data)
+                                parsed = rust_clob.fast_parse_binance_trade(msg.data)
                                 if parsed:
-                                    self._process_trade(parsed[0], parsed[1], parsed[3])
+                                    self._process_trade(parsed[0])
                             elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
                                 break
             except Exception as e:
@@ -46,18 +43,10 @@ class BinanceTradeStream:
             if not self.closed:
                 await asyncio.sleep(2)
 
-    def _process_trade(self, p: float, qty: float = 0.0, is_buyer_maker: bool = False):
-        prev_price = self.last_price
+    def _process_trade(self, p: float):
         self.last_price = p
-        now = time.time()
-        self.last_ts = now
-        self._rust_tracker.record_trade_flow(p, qty, is_buyer_maker, now)
-
-        if self.on_event and (prev_price is None or p != prev_price):
-            try:
-                self.on_event()
-            except Exception:
-                pass
+        self.last_ts = time.time()
+        self._rust_tracker.record_trade(p, self.last_ts)
 
         if self.on_update:
             asyncio.create_task(self.on_update({"price": self.last_price, "ts": self.last_ts}))
@@ -71,14 +60,6 @@ class BinanceTradeStream:
         if self.last_price is None:
             return None
         return self._rust_tracker.get_momentum(lookback_s)
-
-    def get_flow_metrics(self, fast_s: float = 4.0, slow_s: float = 12.0,
-                         extreme_s: float = 30.0) -> Optional[Dict[str, float]]:
-        """Multi-window momentum curl, aggressor buy/sell volume imbalance, and bounce off recent extreme.
-        Executed natively in Rust with ZERO Python fallback."""
-        if self.last_price is None or self.last_ts is None:
-            return None
-        return self._rust_tracker.get_flow_metrics(float(fast_s), float(slow_s), float(extreme_s))
 
     def close(self):
         self.closed = True
@@ -180,9 +161,8 @@ class ClobBookStream:
     URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
     PING_INTERVAL_S = 10.0     # venue keepalive cadence
 
-    def __init__(self, ws_url: Optional[str] = None, on_event: Optional[Callable[[], None]] = None):
+    def __init__(self, ws_url: Optional[str] = None):
         self.ws_url = ws_url or self.URL
-        self.on_event = on_event
         self.asset_ids: List[str] = []
         # Rust accelerated BTreeMap order book trackers per asset (sole source of book state)
         self._rust_trackers: Dict[str, Any] = {}
@@ -268,11 +248,6 @@ class ClobBookStream:
         if tracker is not None:
             tracker.apply_snapshot(msg.get("bids") or [], msg.get("asks") or [], ts)
         self._snapshot_seen.add(aid)
-        if self.on_event:
-            try:
-                self.on_event()
-            except Exception:
-                pass
 
     def _apply_market_resolved(self, msg: Dict):
         """The venue PUSHES the settlement result. Recording it here replaces polling Gamma
@@ -291,11 +266,6 @@ class ClobBookStream:
         for tid in (msg.get("assets_ids") or msg.get("asset_ids") or []):
             if tid:
                 self.resolutions[str(tid)] = entry
-        if self.on_event:
-            try:
-                self.on_event()
-            except Exception:
-                pass
 
     def resolution_for(self, *keys) -> Optional[Dict]:
         for k in keys:
@@ -305,7 +275,6 @@ class ClobBookStream:
 
     def _apply_price_change(self, msg: Dict):
         ts = time.time()
-        changed = False
         for ch in msg.get("price_changes") or []:
             aid = str(ch.get("asset_id") or "")
             if not aid or aid not in self.asset_ids or aid not in self._snapshot_seen:
@@ -313,12 +282,6 @@ class ClobBookStream:
             tracker = self._rust_trackers.get(aid)
             if tracker is not None:
                 tracker.apply_price_change(ch.get("side", ""), ch.get("price"), ch.get("size"), ts)
-                changed = True
-        if changed and self.on_event:
-            try:
-                self.on_event()
-            except Exception:
-                pass
 
     async def start(self):
         while not self.closed:

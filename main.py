@@ -164,18 +164,10 @@ def get_ws_symbol_filter(symbol: str) -> str:
         return s[:-4].lower()
     return s.lower()
 
-# Event-driven tick wakeup: Binance trades & CLOB book updates set this immediately
-# so update_loop reacts in milliseconds instead of waiting for POLL_INTERVAL_MS.
-_tick_wakeup: Optional[asyncio.Event] = None
-
-def _trigger_tick() -> None:
-    if _tick_wakeup is not None:
-        _tick_wakeup.set()
-
 # Background task instances
-binance_stream = ws_data.BinanceTradeStream(symbol=settings.SYMBOL, on_event=_trigger_tick)
-# 1m is the VOLATILITY base: fast EWMA vol + baseline are measured per-minute here and the
-# fair-prob horizon scales as sqrt(minutes_left) with zero drift. Must hold >= VOL_LOOKBACK_1M candles.
+binance_stream = ws_data.BinanceTradeStream(symbol=settings.SYMBOL)
+# 1m is the VOLATILITY base: realized drift/sigma are measured per-minute here and the
+# fair-prob horizon scales as sqrt(minutes_left). Must hold >= VOL_LOOKBACK_1M candles.
 binance_kline_1m = ws_data.BinanceKlineStream(symbol=settings.SYMBOL, interval="1m", limit=500)
 # 5m is the WINDOW base: each candle's open IS the 5m market's open (same boundaries).
 binance_kline_5m = ws_data.BinanceKlineStream(symbol=settings.SYMBOL, interval="5m", limit=200)
@@ -186,7 +178,7 @@ polymarket_ws_stream = ws_data.PolymarketChainlinkStream(
 )
 chainlink_ws_stream = ws_data.ChainlinkPriceStream(aggregator=settings.get_aggregator(settings.SYMBOL))
 # Live CLOB order books, pushed. Replaces REST /book polling on the critical path.
-clob_book_stream = ws_data.ClobBookStream(on_event=_trigger_tick)
+clob_book_stream = ws_data.ClobBookStream()
 # Authenticated user channel — pushes OUR fills so `shares` is the venue's number and not
 # our estimate. Idles until live mode has a key (the provider returns None in paper).
 clob_user_stream = ws_data.ClobUserStream(
@@ -409,7 +401,14 @@ async def fetch_polymarket_snapshot() -> Dict[str, Any]:
     # Polling /book was the tick-rate floor (~2.8s). The whole thesis is that we see a
     # move before the book reprices, so a seconds-old view of the book defeats the point.
     # The WS carries a live snapshot + level deltas; we read it with zero network cost.
-    clob_book_stream.set_assets([up_token_id, down_token_id])
+    # Also keep any open/expiring active trade's token_id subscribed until it settles so
+    # we don't miss Polymarket's pushed `market_resolved` event across the window roll.
+    sub_assets = [up_token_id, down_token_id]
+    for _t in state["active_trades"]:
+        _tid = _t.get("token_id")
+        if _tid and str(_tid) not in sub_assets:
+            sub_assets.append(str(_tid))
+    clob_book_stream.set_assets(sub_assets)
     up_live = clob_book_stream.is_live(up_token_id)
     down_live = clob_book_stream.is_live(down_token_id)
 
@@ -578,10 +577,6 @@ async def execute_trade(decision: Dict[str, Any], market_prices: Dict[str, Any],
         return "insufficient_balance"
 
     slippage = (fill_price - price) if price else 0.0
-    if settings.MAX_ENTRY_SLIPPAGE > 0 and slippage > settings.MAX_ENTRY_SLIPPAGE + 1e-9:
-        log_message(f"Skip {side}: slippage {slippage*100:.2f}¢ > max {settings.MAX_ENTRY_SLIPPAGE*100:.2f}¢ "
-                    f"(ask {price*100:.1f}¢ -> VWAP {fill_price*100:.1f}¢ for ${stake:.2f} stake)")
-        return "slippage_too_high"
 
     # Snapshot the immediate liquidation bid at entry so stop-loss measures real
     # adverse movement rather than firing instantly on a wide underdog bid-ask spread.
@@ -628,12 +623,8 @@ async def execute_trade(decision: Dict[str, Any], market_prices: Dict[str, Any],
         "best_ask_at_entry": price,     # top of book, for slippage attribution
         "entry_bid": entry_bid,         # bid VWAP at entry, for spread-adjusted SL
         "entry_liquidation_usd": entry_liquidation_usd,
-        "peak_bid": entry_bid or 0.0,   # highest bid VWAP seen while open (for trailing stop)
         "slippage": slippage,
         "amount": amount_to_risk,
-        "original_amount": amount_to_risk,
-        "recovered_usd": 0.0,           # proceeds already banked via Tier 1 free-roll
-        "free_rolled": False,
         "shares": shares,
         "entry_ts": time.time(),
         "entry_time": datetime.now().isoformat(),
@@ -683,8 +674,6 @@ async def execute_trade(decision: Dict[str, Any], market_prices: Dict[str, Any],
             marketable_quote,
             trade["neg_risk"],
             trade["tick_size"],
-            settings.CLOB_ORDER_TYPE,
-            settings.CLOB_POST_ONLY,
         )
         if result.get("ok"):
             resp = result.get("response") or {}
@@ -821,9 +810,7 @@ async def maybe_flip_position(fair_up: Optional[float], poly_snapshot: Dict[str,
     trade["exit_time"] = datetime.now().isoformat()
     trade["exit_reason"] = "flip"
     trade["settlement_price_at_expiry"] = exit_price
-    orig_amount = float(trade.get("original_amount") or trade["amount"])
-    recovered = float(trade.get("recovered_usd") or 0.0)
-    trade["profit_loss"] = (recovered + exit_proceeds) - orig_amount
+    trade["profit_loss"] = exit_proceeds - trade["amount"]
     # The realized P/L above is the early-exit sell. Record the market OPEN now; the
     # CLOSE + whether this side actually won gets backfilled once the window ends
     # (see the backfill pass in update_loop). This is why a flip can book a loss even
@@ -878,63 +865,8 @@ async def maybe_tp_sl(poly_snapshot: Dict[str, Any]):
         return None
 
     amount = trade["amount"]
-    orig_amount = float(trade.get("original_amount") or amount)
-    recovered = float(trade.get("recovered_usd") or 0.0)
-    unreal = (recovered + ex["proceeds"]) - orig_amount
-    pl_pct = (unreal / orig_amount) * 100.0 if orig_amount else 0.0
-
-    # Track peak bid for Tier 2 trailing stop
-    peak_bid = max(float(trade.get("peak_bid") or 0.0), float(exit_price))
-    trade["peak_bid"] = peak_bid
-
-    tp_cents = getattr(settings, "TAKE_PROFIT_CENTS", settings.TAKE_PROFIT_PCT)
-
-    # ── Tier 1: Free-Roll Partial Take Profit ───────────────────────────────────
-    # Sell FREE_ROLL_SELL_FRAC (default 50%) when bid reaches >= max(mult * entry, min_cents),
-    # recovering initial stake so the remaining shares become a risk-free runner.
-    if (settings.FREE_ROLL_ENABLED
-            and not trade.get("free_rolled")
-            and (tp_cents <= 0 or (exit_price * 100.0) < tp_cents)):
-        fr_target = max(
-            float(trade["entry_price"]) * float(settings.FREE_ROLL_MULT),
-            float(settings.FREE_ROLL_MIN_CENTS) / 100.0,
-        )
-        if exit_price >= fr_target:
-            sell_frac = min(0.9, max(0.1, float(settings.FREE_ROLL_SELL_FRAC)))
-            sell_shares = float(trade["shares"]) * sell_frac
-            fr_ex = data.walk_bids(ob.get("bidLevels") or [], sell_shares)
-            if fr_ex.get("vwap") and (fr_ex.get("sold_shares") or 0.0) + 1e-6 >= sell_shares:
-                fr_price = fr_ex["vwap"]
-                fr_proceeds = fr_ex["proceeds"]
-                if state["trading_mode"] == "live":
-                    token_id = token_ids.get(held_key)
-                    fr_res = await asyncio.to_thread(
-                        clob_trader.place_market_sell,
-                        token_id,
-                        sell_shares,
-                        fr_ex.get("worst_price") or fr_price,
-                        trade.get("neg_risk", False),
-                        trade.get("tick_size"),
-                    )
-                    if not fr_res.get("ok"):
-                        log_message(f"FREE ROLL sell FAILED ({trade['side']}): {fr_res.get('error')}")
-                        return None
-                    if fr_res.get("filled_shares"):
-                        sell_shares = float(fr_res["filled_shares"])
-                    if fr_res.get("filled_usdc"):
-                        fr_proceeds = float(fr_res["filled_usdc"])
-                else:
-                    state["paper_balance"] += fr_proceeds
-
-                trade["shares"] = max(0.0, float(trade["shares"]) - sell_shares)
-                trade["recovered_usd"] = recovered + fr_proceeds
-                trade["free_rolled"] = True
-                save_state()
-                log_message(
-                    f"FREE ROLL (Tier 1): sold {sell_shares:.1f} {trade['side']} sh @ {fr_price*100:.1f}¢ "
-                    f"(banked ${fr_proceeds:.2f} vs ${orig_amount:.2f} stake); {trade['shares']:.1f} sh riding risk-free"
-                )
-                return "free_roll"
+    unreal = ex["proceeds"] - amount
+    pl_pct = (unreal / amount) * 100.0 if amount else 0.0
 
     # Spread-adjusted stop-loss basis: on thin underdog books, the bid-ask spread alone
     # can exceed STOP_LOSS_PCT on tick 0. Anchor SL drawdown to min(stake, entry_liquidation)
@@ -955,15 +887,11 @@ async def maybe_tp_sl(poly_snapshot: Dict[str, Any]):
     sl_drawdown_pct = ((ex["proceeds"] - sl_base) / sl_base) * 100.0 if sl_base else 0.0
 
     hit = None
-    # Strategy B (Convexity Scalp): Final TP in CENTS per share, plus Peak Trailing Bid
+    # Strategy B (Convexity Scalp): Take profit is in CENTS per share (e.g. 25 = 25¢ / $0.25 exit price)
+    tp_cents = getattr(settings, "TAKE_PROFIT_CENTS", settings.TAKE_PROFIT_PCT)
     if tp_cents > 0 and (exit_price * 100.0) >= tp_cents:
         hit = "take_profit"
-    elif (settings.TRAILING_STOP_ENABLED
-          and (peak_bid * 100.0) >= float(settings.TRAILING_ACTIVATE_CENTS)
-          and ((peak_bid - exit_price) * 100.0) >= float(settings.TRAILING_DROP_CENTS) - 1e-9):
-        hit = "trailing_stop"
-    elif (not trade.get("free_rolled")
-          and settings.STOP_LOSS_PCT > 0
+    elif (settings.STOP_LOSS_PCT > 0
           and held_s >= sl_grace_s
           and pl_pct <= -settings.STOP_LOSS_PCT + 1e-9
           and sl_drawdown_pct <= -settings.STOP_LOSS_PCT + 1e-9):
@@ -1002,8 +930,7 @@ async def maybe_tp_sl(poly_snapshot: Dict[str, Any]):
     # Lock this market so no re-entry until the next 5m window.
     state["tp_sl_locked_market"] = str(market.get("id"))
     save_state()
-    label = ("TAKE PROFIT (Strategy B Scalp)" if hit == "take_profit"
-             else (f"TRAILING BID STOP (peak {peak_bid*100:.1f}¢)" if hit == "trailing_stop" else "STOP LOSS"))
+    label = "TAKE PROFIT (Strategy B Scalp)" if hit == "take_profit" else "STOP LOSS"
     log_message(f"{label}: closed {trade['side']} @ {exit_price*100:.1f}¢ (P/L ${unreal:.2f}, {pl_pct:+.1f}%); locked market until next window")
     return hit
 
@@ -1063,9 +990,7 @@ async def close_active_trade_now() -> Dict[str, Any]:
         proceeds = ex["proceeds"] + remainder * exit_price
         state["paper_balance"] += proceeds
 
-    orig_amount = float(trade.get("original_amount") or trade["amount"])
-    recovered = float(trade.get("recovered_usd") or 0.0)
-    unreal = (recovered + proceeds) - orig_amount
+    unreal = proceeds - trade["amount"]
     trade["status"] = "CLOSED"
     trade["exit_time"] = datetime.now().isoformat()
     trade["exit_reason"] = "manual"
@@ -1133,29 +1058,35 @@ async def update_trades(current_prices: Dict[str, Any]):
         # closing against a different feed than the one that set the strike would inject that
         # whole offset into the result and flip near-the-money windows on its own.
         if expired and trade.get("close_price") is None:
-            at_close = polymarket_ws_stream.price_at(end_ts * 1000, tol_ms=3000,
-                                                     source=trade.get("strike_source"))
-            frozen_close = (at_close or {}).get("price") or cur_price or trade.get("last_price")
-            if frozen_close:
-                trade["close_price"] = frozen_close
+            if trade.get("strike_source") == "polymarket_twap":
+                # Keep TWAP-anchored trades on the TWAP feed (never freeze instantaneous spot
+                # as the close for a TWAP strike).
+                twap_close = polybolt_feed.twap_at(end_ts, _ps_tol())
+                if twap_close is not None:
+                    trade["close_price"] = twap_close
+            else:
+                at_close = polymarket_ws_stream.price_at(end_ts * 1000, tol_ms=3000,
+                                                         source=trade.get("strike_source"))
+                frozen_close = (at_close or {}).get("price") or cur_price or trade.get("last_price")
+                if frozen_close:
+                    trade["close_price"] = frozen_close
 
         if expired and trade.get("expired_at") is None:
             trade["expired_at"] = now_ts
+            trade["last_api_check"] = 0  # poll Gamma immediately once the window expires
         waited = (now_ts - trade["expired_at"]) if trade.get("expired_at") else 0.0
 
-        _pt = _ps_settle_call(trade)
-
-        # ── Authoritative resolution: PUSHED, not polled ─────────────────────────
-        # The CLOB market channel we are already subscribed to emits `market_resolved`
-        # with the winning asset id. That arrives within a frame of the venue deciding,
-        # instead of up to 15s later, and costs no request. The REST poll below is kept
-        # only as a fallback for when the socket missed the event (e.g. it fired while we
-        # were reconnecting across the window roll), and is throttled to 15s as before.
+        # ── Authoritative resolution: Polymarket venue FIRST (pushed WS + Gamma REST) ──
+        # Never settle early on local TWAP or price comparison while Polymarket's own
+        # official resolution is pending: a tiny timestamp/tick discrepancy on a close
+        # window can otherwise flip a LOSS into a false WIN.
         ws_res = clob_book_stream.resolution_for(trade.get("condition_id"),
                                                  trade.get("market_slug"),
                                                  trade.get("token_id"))
         market = None
-        if ws_res is None and trade.get("last_api_check", 0) < now_ts - 15:
+        # Poll Gamma every 3s once expired (fast authoritative settlement), 15s while live.
+        poll_interval = 3.0 if expired else 15.0
+        if ws_res is None and trade.get("last_api_check", 0) < now_ts - poll_interval:
             try:
                 market = await data.fetch_market_by_slug(trade["market_slug"])
             except Exception:
@@ -1163,7 +1094,8 @@ async def update_trades(current_prices: Dict[str, Any]):
             trade["last_api_check"] = now_ts
             if market is not None:
                 trade["_market_closed"] = bool(market.get("closed"))
-        market_closed = bool(ws_res) or trade.get("_market_closed", False)
+                trade["_uma_resolved"] = str(market.get("umaResolutionStatus") or "").lower() == "resolved"
+        market_closed = bool(ws_res) or trade.get("_market_closed", False) or trade.get("_uma_resolved", False)
 
         # Still live: window running and market still open → keep waiting.
         if not expired and not market_closed:
@@ -1187,17 +1119,8 @@ async def update_trades(current_prices: Dict[str, Any]):
         winning_index = -1
         resolution = None
 
-        # 0) Best source: PolyBolt published TWAPs (the official Polymarket 60s averages)
-        if _pt:
-            winning_index = up_index if _pt[0] == "UP" else down_index
-            resolution = "polymarket_twap"
-            strike, settlement_price = _pt[2], _pt[1]
-            trade["settlement_price_at_expiry"] = trade["close_price"] = settlement_price
-            trade["strike_price"] = strike
-            trade["settle_wait_s"] = round(waited, 1)
-
-        # 1) Venue PUSHED winner over CLOB WebSocket
-        elif ws_res:
+        # 1) Authoritative: Venue PUSHED winner over CLOB WebSocket
+        if ws_res:
             win_asset = str(ws_res.get("winning_asset_id") or "")
             win_outcome = str(ws_res.get("winning_outcome") or "").lower()
             if win_asset and str(trade.get("token_id") or "") == win_asset:
@@ -1210,42 +1133,50 @@ async def update_trades(current_prices: Dict[str, Any]):
                 winning_index = down_index if trade["side"] == "UP" else up_index
                 resolution = "ws_market_resolved"
 
-        # If not resolved by TWAP or ws_res, and still within authoritative settle wait: wait for TWAP/venue
-        if winning_index == -1 and waited < getattr(settings, "AUTHORITATIVE_SETTLE_WAIT_S", 60.0) and not market_closed:
+        # 2) Authoritative: Gamma API reports market CLOSED / UMA resolved with finalized
+        #    outcomePrices (strictly >= 0.99 vs <= 0.01, i.e. [1, 0] or [0, 1] — never a
+        #    transient pre-resolution market quote).
+        if winning_index == -1 and market_closed and outcome_prices:
+            try:
+                parsed_px = [float(p) for p in outcome_prices]
+                if len(parsed_px) >= 2:
+                    max_p = max(parsed_px)
+                    min_p = min(parsed_px)
+                    if max_p >= 0.99 and min_p <= 0.01:
+                        winning_index = parsed_px.index(max_p)
+                        resolution = "polymarket_settled"
+                        trade["settle_wait_s"] = round(waited, 1)
+            except Exception:
+                pass
+
+        # Wait for Polymarket's authoritative outcome before falling back to ANY local
+        # price/TWAP estimate — even if `closed` flipped true before outcomePrices finalized.
+        if winning_index == -1 and waited < getattr(settings, "AUTHORITATIVE_SETTLE_WAIT_S", 90.0):
             remaining_active.append(trade)
             continue
 
-        # 1) Authoritative — ONLY when Polymarket says the market is CLOSED. outcomePrices is
-        # a (laggy) market price, not a settlement flag: a side trading >0.9 while the market
-        # is still open is just the favourite, not the resolved winner. Requiring `closed`
-        # avoids mis-settling on a transient pre-settlement price.
-        if winning_index == -1 and market_closed:
-            for i, p in enumerate(outcome_prices):
-                try:
-                    if float(p) > 0.9:
-                        winning_index = i
-                        resolution = "polymarket_settled"
-                        break
-                except Exception:
-                    pass
+        # 3) Fallback ONLY after AUTHORITATIVE_SETTLE_WAIT_S: PolyBolt published 60s TWAPs
+        _pt = _ps_settle_call(trade)
+        if winning_index == -1 and _pt:
+            winning_index = up_index if _pt[0] == "UP" else down_index
+            resolution = "polymarket_twap_fallback"
+            strike, settlement_price = _pt[2], _pt[1]
+            trade["settlement_price_at_expiry"] = trade["close_price"] = settlement_price
+            trade["strike_price"] = strike
+            trade["settle_wait_s"] = round(waited, 1)
 
-        # 2) Fallback once the window/market is over: frozen CLOSE vs STRIKE (open). Both are
-        # the Polymarket crypto_prices value (open at eventStartTime, close at end), so this
-        # mirrors Polymarket's rule exactly: close >= open → Up (a tie resolves UP, per the
-        # market's "greater than OR EQUAL TO" wording).
+        # 4) Last-resort fallback: frozen CLOSE vs STRIKE (open) on the SAME feed.
+        #    Never compare instantaneous spot against a TWAP strike.
         strike = trade.get("strike_price")  # the marked OPEN
         settlement_price = (trade.get("close_price") or trade.get("settlement_price_at_expiry")
                             or trade.get("last_price") or cur_price)  # the frozen CLOSE
-        # `close_price` was frozen from a live feed AT expiry, so it is trustworthy even if
-        # the feed died afterwards. Anything else is only a running last-seen value, and
-        # using it while the feed is stale means resolving against a frozen number — so in
-        # that case we decline to settle and let the grace period handle it.
         close_is_frozen = trade.get("close_price") is not None
-        if winning_index == -1 and (expired or market_closed):
+        same_feed_ok = trade.get("strike_source") != "polymarket_twap"
+        if winning_index == -1 and (expired or market_closed) and same_feed_ok:
             if strike and settlement_price and (close_is_frozen or settle_price_fresh):
                 trade["settlement_price_at_expiry"] = settlement_price
                 winning_index = up_index if settlement_price >= strike else down_index
-                resolution = "close_vs_open"
+                resolution = "close_vs_open_fallback"
             elif strike and settlement_price and not trade.get("_logged_stale_settle"):
                 trade["_logged_stale_settle"] = True
                 log_message(f"Settlement feed stale for {trade['market_slug']} — holding for "
@@ -1285,13 +1216,11 @@ async def update_trades(current_prices: Dict[str, Any]):
         trade["close_price"] = close_px
         trade["resolution"] = resolution or "unknown"
         if open_px and close_px:
-            move_side = "UP" if close_px > open_px else "DOWN"
+            move_side = "UP" if close_px >= open_px else "DOWN"
             dir_txt = f"open {open_px:.2f} -> close {close_px:.2f} ({move_side} by {abs(close_px - open_px):.2f})"
         else:
             dir_txt = f"open {open_px} -> close {close_px}"
 
-        orig_amount = float(trade.get("original_amount") or trade["amount"])
-        recovered = float(trade.get("recovered_usd") or 0.0)
         if won:
             payout = trade["shares"] * 1.0
             # Paper credits the simulated balance; live balance comes from the
@@ -1313,11 +1242,11 @@ async def update_trades(current_prices: Dict[str, Any]):
                     "slug": trade.get("market_slug"),
                     "attempts": 0,
                 })
-            trade["profit_loss"] = (recovered + payout) - orig_amount
+            trade["profit_loss"] = payout - trade["amount"]
             result = "WIN"
         else:
-            trade["profit_loss"] = recovered - orig_amount
-            result = "LOSS" if trade["profit_loss"] < 0 else "WIN"
+            trade["profit_loss"] = -trade["amount"]
+            result = "LOSS"
 
         log_message(f"{result} [{resolution or 'unknown'}] {trade['side']}: {dir_txt} -> P/L ${trade['profit_loss']:.2f} ({trade['market_slug']})")
 
@@ -1525,10 +1454,6 @@ async def seed_kline_buffers():
         log_message(f"Failed to seed kline buffers: {e}")
 
 async def update_loop():
-    global _tick_wakeup
-    _tick_wakeup = asyncio.Event()
-    last_csv_ts = 0.0
-
     csv_header = [
         "timestamp", "entry_minute", "time_left_min", "signal",
         "model_up", "model_down", "mkt_up", "mkt_down", "edge_up", "edge_down",
@@ -1538,7 +1463,6 @@ async def update_loop():
     ]
 
     while True:
-        tick_start = time.monotonic()
         try:
             timing = get_candle_window_timing(settings.CANDLE_WINDOW_MINUTES)
 
@@ -1747,20 +1671,15 @@ async def update_loop():
                 effective_spot = strike_open + (spot_price - binance_open)
             else:
                 effective_spot = spot_price
-            sigma_1m, sigma_ewma = indicators.adaptive_vol(
-                klines_1m,
-                lookback=settings.VOL_LOOKBACK_1M,
-                half_life=settings.VOL_EWMA_HALF_LIFE,
-            )
+            drift_1m, sigma_1m = indicators.realized_drift_vol(klines_1m, lookback=settings.VOL_LOOKBACK_1M)
             fair_up = indicators.fair_prob_up(effective_spot or 0, model_open or 0, time_left_min,
-                                              sigma_1m, drift_per_minute=0.0)
+                                              sigma_1m, drift_per_minute=drift_1m or 0.0)
             fair_data = {
                 "prob_up": fair_up,
                 "prob_down": 1.0 - fair_up,
                 "bias": "BULLISH" if fair_up > 0.6 else "BEARISH" if fair_up < 0.4 else "NEUTRAL",
                 "minutes_left": time_left_min,
                 "sigma_1m": sigma_1m,
-                "sigma_ewma": sigma_ewma,
             }
 
             # ── The price we'd ACTUALLY pay, for the size we'd actually trade ────
@@ -1799,13 +1718,8 @@ async def update_loop():
             }
             prob_view = {"adjustedUp": fair_up, "adjustedDown": 1 - fair_up}
 
-            # Strategy C: Aggressor-flow + multi-window spot momentum hook
+            # Strategy C: Spot momentum hook over configured lookback window
             spot_momentum = binance_stream.get_momentum(settings.MOMENTUM_LOOKBACK_S)
-            flow_metrics = binance_stream.get_flow_metrics(
-                fast_s=settings.MOMENTUM_FAST_S,
-                slow_s=settings.MOMENTUM_SLOW_S,
-                extreme_s=30.0,
-            )
 
             decision = engines.decide_underdog_reversal({
                 "mcProbUp": fair_up,
@@ -1816,16 +1730,11 @@ async def update_loop():
                 "sigma1m": sigma_1m,
                 "timeLeftMin": time_left_min,
                 "momentum": spot_momentum,
-                "flowMetrics": flow_metrics,
                 "maxUnderdogPrice": settings.MAX_UNDERDOG_PRICE,
                 "minUnderdogProb": settings.MIN_UNDERDOG_PROB,
                 "minUnderdogEv": settings.MIN_UNDERDOG_EV,
                 "maxSigmaDistance": settings.MAX_SIGMA_DISTANCE,
-                "minTimeLeftMin": settings.MIN_TIME_LEFT_MIN,
-                "maxTimeLeftMin": settings.MAX_TIME_LEFT_MIN,
                 "momentumFilter": settings.MOMENTUM_FILTER_ENABLED,
-                "minBounceSigma": settings.MIN_BOUNCE_SIGMA,
-                "minFlowImbalance": settings.MIN_FLOW_IMBALANCE,
             })
 
             current_prices_dict = {"spot": spot_price, "chainlink": current_price,
@@ -1895,9 +1804,7 @@ async def update_loop():
                     if ex["vwap"] and ex["sold_shares"] + 1e-6 >= t["shares"]:
                         t["cur_bid"] = ex["vwap"]
                 mark = t.get("cur_bid") or t.get("entry_price")  # fall back to entry (neutral) until we see a bid
-                orig_amt = float(t.get("original_amount") or t["amount"])
-                rec_usd = float(t.get("recovered_usd") or 0.0)
-                t["unrealized_pl"] = (rec_usd + t["shares"] * mark) - orig_amt
+                t["unrealized_pl"] = (t["shares"] * mark) - t["amount"]
                 open_value += t["shares"] * mark
             equity = state["paper_balance"] + open_value
 
@@ -1942,20 +1849,15 @@ async def update_loop():
                                else f"flip_close_only_{flip_result.get('reason')}")
             else:
                 signal_label = f"BUY {decision['side']}" if decision["action"] == "ENTER" else "NO TRADE"
-            now_mono = time.monotonic()
-            csv_due = (now_mono - last_csv_ts) >= (settings.POLL_INTERVAL_MS / 1000.0)
-            important_event = bool(flip_side or tp_sl_hit or exec_result == "entered")
-            if csv_due or important_event:
-                last_csv_ts = now_mono
-                utils.append_csv_row("./logs/signals.csv", csv_header, [
-                    datetime.now().isoformat(), timing["elapsedMinutes"], time_left_min,
-                    signal_label, fair_up, 1 - fair_up, market_up, market_down,
-                    edge["edgeUp"], edge["edgeDown"],
-                    # chosen-side prob/price/ev — present on ENTER and NO_TRADE alike
-                    decision.get("side"), decision.get("prob"), decision.get("price"), decision.get("ev"),
-                    f"{decision['side']}:{decision['phase']}:{decision['strength']}" if decision["action"] == "ENTER" else "NO_TRADE",
-                    decision.get("reason", ""), exec_result or ""
-                ])
+            utils.append_csv_row("./logs/signals.csv", csv_header, [
+                datetime.now().isoformat(), timing["elapsedMinutes"], time_left_min,
+                signal_label, fair_up, 1 - fair_up, market_up, market_down,
+                edge["edgeUp"], edge["edgeDown"],
+                # chosen-side prob/price/ev — present on ENTER and NO_TRADE alike
+                decision.get("side"), decision.get("prob"), decision.get("price"), decision.get("ev"),
+                f"{decision['side']}:{decision['phase']}:{decision['strength']}" if decision["action"] == "ENTER" else "NO_TRADE",
+                decision.get("reason", ""), exec_result or ""
+            ])
 
             state["latest_data"] = {
                 "timestamp": datetime.now().isoformat(),
@@ -2020,18 +1922,7 @@ async def update_loop():
         except Exception as e:
             print(f"Error in update loop: {e}")
 
-        # Event-driven wakeup: sleep at least EVENT_MIN_INTERVAL_MS (25ms) to coalesce bursts,
-        # then wake immediately on the next Binance trade or CLOB book update (max wait = POLL_INTERVAL_MS).
-        min_wait_s = max(0.005, float(getattr(settings, "EVENT_MIN_INTERVAL_MS", 25)) / 1000.0)
-        elapsed_s = time.monotonic() - tick_start
-        if elapsed_s < min_wait_s:
-            await asyncio.sleep(min_wait_s - elapsed_s)
-        max_wait_s = max(0.05, float(settings.POLL_INTERVAL_MS) / 1000.0)
-        _tick_wakeup.clear()
-        try:
-            await asyncio.wait_for(_tick_wakeup.wait(), timeout=max_wait_s)
-        except asyncio.TimeoutError:
-            pass
+        await asyncio.sleep(settings.POLL_INTERVAL_MS / 1000)
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -2101,21 +1992,14 @@ async def get_settings():
         "trading": {
             "symbol": settings.SYMBOL,
             "risk_type": settings.RISK_TYPE,
-            "risk_value": settings.RISK_VALUE,
-            "max_entry_slippage": settings.MAX_ENTRY_SLIPPAGE,
-            "clob_order_type": settings.CLOB_ORDER_TYPE,
-            "clob_post_only": settings.CLOB_POST_ONLY
+            "risk_value": settings.RISK_VALUE
         },
         "underdog": {
             "max_price": settings.MAX_UNDERDOG_PRICE,
             "min_prob": settings.MIN_UNDERDOG_PROB,
             "min_ev": settings.MIN_UNDERDOG_EV,
             "max_sigma_distance": settings.MAX_SIGMA_DISTANCE,
-            "min_time_left_min": settings.MIN_TIME_LEFT_MIN,
-            "max_time_left_min": settings.MAX_TIME_LEFT_MIN,
             "momentum_filter": settings.MOMENTUM_FILTER_ENABLED,
-            "min_bounce_sigma": settings.MIN_BOUNCE_SIGMA,
-            "min_flow_imbalance": settings.MIN_FLOW_IMBALANCE,
             "min_book_liquidity_usd": settings.MIN_BOOK_LIQUIDITY_USD
         },
         "ev": {
@@ -2133,14 +2017,7 @@ async def get_settings():
             "take_profit_cents": getattr(settings, "TAKE_PROFIT_CENTS", settings.TAKE_PROFIT_PCT),
             "take_profit_pct": getattr(settings, "TAKE_PROFIT_CENTS", settings.TAKE_PROFIT_PCT),
             "stop_loss_pct": settings.STOP_LOSS_PCT,
-            "stop_loss_grace_s": settings.STOP_LOSS_GRACE_S,
-            "free_roll_enabled": settings.FREE_ROLL_ENABLED,
-            "free_roll_mult": settings.FREE_ROLL_MULT,
-            "free_roll_min_cents": settings.FREE_ROLL_MIN_CENTS,
-            "free_roll_sell_frac": settings.FREE_ROLL_SELL_FRAC,
-            "trailing_stop_enabled": settings.TRAILING_STOP_ENABLED,
-            "trailing_activate_cents": settings.TRAILING_ACTIVATE_CENTS,
-            "trailing_drop_cents": settings.TRAILING_DROP_CENTS
+            "stop_loss_grace_s": settings.STOP_LOSS_GRACE_S
         },
         "price_stream": polybolt.merged(settings.PRICE_STREAM),
         "chainlink": {
@@ -2207,9 +2084,6 @@ async def post_settings(new_settings: Dict[str, Any]):
         settings.SYMBOL = t.get("symbol", settings.SYMBOL)
         settings.RISK_TYPE = t.get("risk_type", settings.RISK_TYPE)
         settings.RISK_VALUE = float(t.get("risk_value", settings.RISK_VALUE))
-        if "max_entry_slippage" in t: settings.MAX_ENTRY_SLIPPAGE = float(t["max_entry_slippage"])
-        if "clob_order_type" in t: settings.CLOB_ORDER_TYPE = str(t["clob_order_type"]).upper()
-        if "clob_post_only" in t: settings.CLOB_POST_ONLY = bool(t["clob_post_only"])
 
     if "underdog" in new_settings:
         ud = new_settings["underdog"]
@@ -2217,11 +2091,7 @@ async def post_settings(new_settings: Dict[str, Any]):
         if "min_prob" in ud: settings.MIN_UNDERDOG_PROB = float(ud["min_prob"])
         if "min_ev" in ud: settings.MIN_UNDERDOG_EV = float(ud["min_ev"])
         if "max_sigma_distance" in ud: settings.MAX_SIGMA_DISTANCE = float(ud["max_sigma_distance"])
-        if "min_time_left_min" in ud: settings.MIN_TIME_LEFT_MIN = float(ud["min_time_left_min"])
-        if "max_time_left_min" in ud: settings.MAX_TIME_LEFT_MIN = float(ud["max_time_left_min"])
         if "momentum_filter" in ud: settings.MOMENTUM_FILTER_ENABLED = bool(ud["momentum_filter"])
-        if "min_bounce_sigma" in ud: settings.MIN_BOUNCE_SIGMA = float(ud["min_bounce_sigma"])
-        if "min_flow_imbalance" in ud: settings.MIN_FLOW_IMBALANCE = float(ud["min_flow_imbalance"])
         if "min_book_liquidity_usd" in ud: settings.MIN_BOOK_LIQUIDITY_USD = float(ud["min_book_liquidity_usd"])
     elif "ev" in new_settings:
         e = new_settings["ev"]
@@ -2252,13 +2122,6 @@ async def post_settings(new_settings: Dict[str, Any]):
         settings.STOP_LOSS_PCT = float(ts.get("stop_loss_pct", settings.STOP_LOSS_PCT))
         if "stop_loss_grace_s" in ts:
             settings.STOP_LOSS_GRACE_S = float(ts["stop_loss_grace_s"])
-        if "free_roll_enabled" in ts: settings.FREE_ROLL_ENABLED = bool(ts["free_roll_enabled"])
-        if "free_roll_mult" in ts: settings.FREE_ROLL_MULT = float(ts["free_roll_mult"])
-        if "free_roll_min_cents" in ts: settings.FREE_ROLL_MIN_CENTS = float(ts["free_roll_min_cents"])
-        if "free_roll_sell_frac" in ts: settings.FREE_ROLL_SELL_FRAC = float(ts["free_roll_sell_frac"])
-        if "trailing_stop_enabled" in ts: settings.TRAILING_STOP_ENABLED = bool(ts["trailing_stop_enabled"])
-        if "trailing_activate_cents" in ts: settings.TRAILING_ACTIVATE_CENTS = float(ts["trailing_activate_cents"])
-        if "trailing_drop_cents" in ts: settings.TRAILING_DROP_CENTS = float(ts["trailing_drop_cents"])
 
     if "polymarket" in new_settings:
         p = new_settings["polymarket"]
@@ -2304,7 +2167,7 @@ async def post_settings(new_settings: Dict[str, Any]):
     if settings.SYMBOL != old_symbol:
         polybolt_feed.set_symbol(polybolt.symbol_for(settings.SYMBOL))
         binance_stream.close()
-        binance_stream = ws_data.BinanceTradeStream(symbol=settings.SYMBOL, on_event=_trigger_tick)
+        binance_stream = ws_data.BinanceTradeStream(symbol=settings.SYMBOL)
         asyncio.create_task(binance_stream.start())
 
         binance_kline_1m.close()

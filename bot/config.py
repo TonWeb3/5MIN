@@ -14,9 +14,6 @@ class Settings(BaseSettings):
     # key or seed phrase). New wallets trade via the gasless deposit-wallet flow
     # (POLY_1271); the relayer key sponsors on-chain setup (deploy/approvals).
     CLOB_MAX_SLIPPAGE: float = 0.02  # marketable-limit buffer above the quote (probability units)
-    CLOB_ORDER_TYPE: str = "FAK"     # Fill-And-Kill (IOC) by default; GTC/FOK also supported
-    CLOB_POST_ONLY: bool = True      # post_only flag for live entry orders (exits always take liquidity)
-    MAX_ENTRY_SLIPPAGE: float = 0.015  # skip entry if walked VWAP - best_ask exceeds this (stake stays exact)
     RELAYER_API_KEY: str = ""        # Polymarket relayer API key (gasless on-chain txs)
 
     # ── Auto-withdrawal (capital extractor) ─────────────────────────────────────
@@ -34,16 +31,14 @@ class Settings(BaseSettings):
     GAMMA_BASE_URL: str = "https://gamma-api.polymarket.com"
     CLOB_BASE_URL: str = "https://clob.polymarket.com"
 
-    # A 5m window is 300s: event-driven triggers fire on every Binance trade / CLOB book
-    # update down to EVENT_MIN_INTERVAL_MS; POLL_INTERVAL_MS is the max idle/logging cadence.
+    # A 5m window is 300s: the poll interval is how fast we SEE the book move, so it
+    # bounds how much of the staleness we can actually capture.
     POLL_INTERVAL_MS: int = 500
-    EVENT_MIN_INTERVAL_MS: int = 25
     CANDLE_WINDOW_MINUTES: int = 5
 
-    # Realized vol is measured on 1m candles with fast EWMA (half-life = 15m) blended with
-    # the 5h baseline, and drift = 0 (zero drift for 5m binary horizon).
-    VOL_LOOKBACK_1M: int = 300          # 1m candles used for baseline vol (5 hours)
-    VOL_EWMA_HALF_LIFE: float = 15.0    # fast EWMA half-life in minutes
+    # Realized drift/vol are measured on 1m candles, so sigma is PER MINUTE and the
+    # fair-prob horizon scales continuously as sqrt(minutes_left).
+    VOL_LOOKBACK_1M: int = 300          # 1m candles used for realized drift/vol (5 hours)
 
     # ── Feed freshness (SAFETY) ─────────────────────────────────────────────────
     # A silently-stalled Binance socket (connection alive, messages stopped) freezes the
@@ -65,7 +60,7 @@ class Settings(BaseSettings):
     # a frozen price silently mis-resolves near-the-money trades, so a price older than
     # this is not used to settle; we wait for the authoritative Polymarket resolution.
     MAX_SETTLE_PRICE_AGE_S: float = 30.0
-    AUTHORITATIVE_SETTLE_WAIT_S: float = 60.0
+    AUTHORITATIVE_SETTLE_WAIT_S: float = 90.0
 
     # Polymarket price stream (TWAP & Price to Beat via ws-live-v2)
     PRICE_STREAM: Dict = {}
@@ -85,14 +80,8 @@ class Settings(BaseSettings):
     MIN_UNDERDOG_PROB: float = 0.10        # Strategy A: min model fair probability (10%)
     MIN_UNDERDOG_EV: float = 0.02          # Strategy A: min expected value (fair - ask >= 2¢)
     MAX_SIGMA_DISTANCE: float = 2.0        # Strategy D: Volatility cone distance threshold (Z-score)
-    MIN_TIME_LEFT_MIN: float = 0.75        # Time-window gate: min minutes left to enter (45s)
-    MAX_TIME_LEFT_MIN: float = 3.5         # Time-window gate: max minutes left to enter (3m30s)
-    MOMENTUM_FILTER_ENABLED: bool = True   # Strategy C: Aggressor-flow + multi-window momentum hook
+    MOMENTUM_FILTER_ENABLED: bool = True   # Strategy C: Binance momentum hook towards strike
     MOMENTUM_LOOKBACK_S: float = 10.0      # Lookback window for momentum in seconds
-    MOMENTUM_FAST_S: float = 4.0           # Fast curl window (seconds)
-    MOMENTUM_SLOW_S: float = 12.0          # Slow curl & aggressor flow window (seconds)
-    MIN_BOUNCE_SIGMA: float = 0.15         # Min bounce off 30s extreme in units of (spot * sigma_1m)
-    MIN_FLOW_IMBALANCE: float = 0.10       # Min aggressor buy/sell volume imbalance [-1..+1]
     MIN_BOOK_LIQUIDITY_USD: float = 20.0   # skip if the ask side can't absorb the stake
 
     # Aliases for backwards compatibility
@@ -108,17 +97,10 @@ class Settings(BaseSettings):
     # Take-profit is in CENTS per share (e.g. 25 = 25¢).
     # Stop-loss is in % of the stake risked (e.g. 50 = down 50% of the stake).
     TP_SL_ENABLED: bool = True
-    TAKE_PROFIT_CENTS: float = 25.0        # sell remaining shares if bid reaches this many cents (25¢)
+    TAKE_PROFIT_CENTS: float = 25.0        # sell if share bid reaches this many cents (25¢)
     TAKE_PROFIT_PCT: float = 25.0          # alias for backwards compatibility
     STOP_LOSS_PCT: float = 50.0            # sell if unrealized loss >= this % of stake (and drop from entry bid)
     STOP_LOSS_GRACE_S: float = 15.0        # min seconds after entry before stop-loss can fire (prevents spread whipsaw)
-    FREE_ROLL_ENABLED: bool = True         # Tier 1 partial TP: sell 50% to recover stake -> free roll runner
-    FREE_ROLL_MULT: float = 2.5            # trigger free-roll at >= 2.5x entry VWAP
-    FREE_ROLL_MIN_CENTS: float = 12.0      # minimum bid in cents for Tier 1 free-roll (12¢)
-    FREE_ROLL_SELL_FRAC: float = 0.5       # fraction of shares sold on Tier 1 free-roll (50%)
-    TRAILING_STOP_ENABLED: bool = True     # Tier 2 peak trailing bid stop
-    TRAILING_ACTIVATE_CENTS: float = 15.0  # activate trailing stop once peak bid reaches 15¢
-    TRAILING_DROP_CENTS: float = 4.0       # exit remaining shares if bid drops 4¢ from peak bid
 
     # Polymarket — BTC "Up or Down" 5-minute series.
     POLYMARKET_SLUG: str = os.getenv("POLYMARKET_SLUG", "")
@@ -251,11 +233,6 @@ def load_settings():
             if "binance_base_url" in trading: base_settings.BINANCE_BASE_URL = trading["binance_base_url"]
             if "candle_window_minutes" in trading: base_settings.CANDLE_WINDOW_MINUTES = int(trading["candle_window_minutes"])
             if "poll_interval_ms" in trading: base_settings.POLL_INTERVAL_MS = int(trading["poll_interval_ms"])
-            if "event_min_interval_ms" in trading: base_settings.EVENT_MIN_INTERVAL_MS = int(trading["event_min_interval_ms"])
-            if "vol_ewma_half_life" in trading: base_settings.VOL_EWMA_HALF_LIFE = float(trading["vol_ewma_half_life"])
-            if "clob_order_type" in trading: base_settings.CLOB_ORDER_TYPE = str(trading["clob_order_type"]).upper()
-            if "clob_post_only" in trading: base_settings.CLOB_POST_ONLY = bool(trading["clob_post_only"])
-            if "max_entry_slippage" in trading: base_settings.MAX_ENTRY_SLIPPAGE = float(trading["max_entry_slippage"])
             if "risk_type" in trading: base_settings.RISK_TYPE = trading["risk_type"]
             if "risk_value" in trading: base_settings.RISK_VALUE = float(trading["risk_value"])
             if "max_spot_age_s" in trading: base_settings.MAX_SPOT_AGE_S = float(trading["max_spot_age_s"])
@@ -281,14 +258,8 @@ def load_settings():
                 base_settings.MIN_UNDERDOG_EV = float(ud["ev_threshold"])
                 base_settings.EV_THRESHOLD = float(ud["ev_threshold"])
             if "max_sigma_distance" in ud: base_settings.MAX_SIGMA_DISTANCE = float(ud["max_sigma_distance"])
-            if "min_time_left_min" in ud: base_settings.MIN_TIME_LEFT_MIN = float(ud["min_time_left_min"])
-            if "max_time_left_min" in ud: base_settings.MAX_TIME_LEFT_MIN = float(ud["max_time_left_min"])
             if "momentum_filter" in ud: base_settings.MOMENTUM_FILTER_ENABLED = bool(ud["momentum_filter"])
             if "momentum_lookback_s" in ud: base_settings.MOMENTUM_LOOKBACK_S = float(ud["momentum_lookback_s"])
-            if "momentum_fast_s" in ud: base_settings.MOMENTUM_FAST_S = float(ud["momentum_fast_s"])
-            if "momentum_slow_s" in ud: base_settings.MOMENTUM_SLOW_S = float(ud["momentum_slow_s"])
-            if "min_bounce_sigma" in ud: base_settings.MIN_BOUNCE_SIGMA = float(ud["min_bounce_sigma"])
-            if "min_flow_imbalance" in ud: base_settings.MIN_FLOW_IMBALANCE = float(ud["min_flow_imbalance"])
             if "min_book_liquidity_usd" in ud: base_settings.MIN_BOOK_LIQUIDITY_USD = float(ud["min_book_liquidity_usd"])
         if "underdog" in config_data or "ev" in config_data: _section("underdog", _underdog)
 
@@ -311,13 +282,6 @@ def load_settings():
                 base_settings.TAKE_PROFIT_PCT = float(ts["take_profit_pct"])
             if "stop_loss_pct" in ts: base_settings.STOP_LOSS_PCT = float(ts["stop_loss_pct"])
             if "stop_loss_grace_s" in ts: base_settings.STOP_LOSS_GRACE_S = float(ts["stop_loss_grace_s"])
-            if "free_roll_enabled" in ts: base_settings.FREE_ROLL_ENABLED = bool(ts["free_roll_enabled"])
-            if "free_roll_mult" in ts: base_settings.FREE_ROLL_MULT = float(ts["free_roll_mult"])
-            if "free_roll_min_cents" in ts: base_settings.FREE_ROLL_MIN_CENTS = float(ts["free_roll_min_cents"])
-            if "free_roll_sell_frac" in ts: base_settings.FREE_ROLL_SELL_FRAC = float(ts["free_roll_sell_frac"])
-            if "trailing_stop_enabled" in ts: base_settings.TRAILING_STOP_ENABLED = bool(ts["trailing_stop_enabled"])
-            if "trailing_activate_cents" in ts: base_settings.TRAILING_ACTIVATE_CENTS = float(ts["trailing_activate_cents"])
-            if "trailing_drop_cents" in ts: base_settings.TRAILING_DROP_CENTS = float(ts["trailing_drop_cents"])
         if "tp_sl" in config_data: _section("tp_sl", _tpsl)
 
         def _chainlink():

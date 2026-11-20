@@ -622,56 +622,6 @@ fn compute_realized_drift_vol(closes: Vec<f64>, lookback: usize) -> (Option<f64>
 }
 
 #[pyfunction]
-#[pyo3(signature = (closes, half_life=15.0, lookback=300))]
-fn compute_ewma_vol(closes: Vec<f64>, half_life: f64, lookback: usize) -> (Option<f64>, Option<f64>) {
-    if closes.len() < 20 {
-        return (None, None);
-    }
-    let sample = if lookback > 0 && closes.len() > lookback {
-        &closes[closes.len() - lookback..]
-    } else {
-        &closes[..]
-    };
-    if sample.len() < 20 {
-        return (None, None);
-    }
-    let mut rets = Vec::with_capacity(sample.len() - 1);
-    for i in 1..sample.len() {
-        if sample[i] <= 0.0 || sample[i - 1] <= 0.0 {
-            continue;
-        }
-        let r = (sample[i] / sample[i - 1]).ln();
-        if r.is_finite() {
-            rets.push(r);
-        }
-    }
-    let n_rets = rets.len();
-    if n_rets < 10 {
-        return (None, None);
-    }
-
-    // Zero-mean baseline variance (drift = 0 for 5m horizon)
-    let mut base_var_sum = 0.0;
-    for &r in &rets {
-        base_var_sum += r * r;
-    }
-    let sigma_baseline = (base_var_sum / (n_rets as f64)).sqrt();
-
-    // Fast EWMA variance with half-life in minutes (default 15m)
-    let hl = half_life.max(2.0);
-    let lambda = (0.5_f64).powf(1.0 / hl);
-    let mut ewma_var = sigma_baseline * sigma_baseline;
-    for &r in &rets {
-        ewma_var = lambda * ewma_var + (1.0 - lambda) * (r * r);
-    }
-    let sigma_ewma = ewma_var.sqrt();
-
-    // Blend 70% fast EWMA + 30% baseline, floored at 50% of baseline
-    let sigma_blended = (0.7 * sigma_ewma + 0.3 * sigma_baseline).max(0.5 * sigma_baseline);
-    (Some(sigma_blended), Some(sigma_ewma))
-}
-
-#[pyfunction]
 fn fast_parse_binance_trade(raw_text: &str) -> Option<(f64, f64)> {
     let p_idx = raw_text.find("\"p\":\"")?;
     let after_p = &raw_text[p_idx + 5..];
@@ -686,40 +636,6 @@ fn fast_parse_binance_trade(raw_text: &str) -> Option<(f64, f64)> {
         0.0
     };
     Some((price, ts_ms))
-}
-
-#[pyfunction]
-fn fast_parse_binance_trade_flow(raw_text: &str) -> Option<(f64, f64, f64, bool)> {
-    let p_idx = raw_text.find("\"p\":\"")?;
-    let after_p = &raw_text[p_idx + 5..];
-    let end_p = after_p.find('\"')?;
-    let price: f64 = after_p[..end_p].parse().ok()?;
-
-    let qty: f64 = if let Some(q_idx) = raw_text.find("\"q\":\"") {
-        let after_q = &raw_text[q_idx + 5..];
-        let end_q = after_q.find('\"').unwrap_or(0);
-        after_q[..end_q].parse().unwrap_or(0.0)
-    } else {
-        0.0
-    };
-
-    let ts_ms: f64 = if let Some(t_idx) = raw_text.find("\"T\":") {
-        let after_t = &raw_text[t_idx + 4..];
-        let end_t = after_t.find(|c: char| !c.is_ascii_digit()).unwrap_or(after_t.len());
-        after_t[..end_t].parse().unwrap_or(0.0)
-    } else {
-        0.0
-    };
-
-    // Binance "m": true => buyer is maker => aggressor is SELLER; false => aggressor is BUYER
-    let is_buyer_maker: bool = if let Some(m_idx) = raw_text.find("\"m\":") {
-        let after_m = raw_text[m_idx + 4..].trim_start();
-        after_m.starts_with("true")
-    } else {
-        false
-    };
-
-    Some((price, qty, ts_ms, is_buyer_maker))
 }
 
 fn extract_f64(obj: &Bound<'_, PyAny>) -> Option<f64> {
@@ -812,8 +728,7 @@ fn fast_walk_bids<'py>(py: Python<'py>, levels: &Bound<'py, PyAny>, shares: f64)
 
 #[pyclass]
 pub struct BinanceTradeTracker {
-    // (timestamp_s, price, qty_usd, is_aggressor_buy)
-    history: VecDeque<(f64, f64, f64, bool)>,
+    history: VecDeque<(f64, f64)>,
     last_price: Option<f64>,
     last_ts: Option<f64>,
 }
@@ -823,25 +738,19 @@ impl BinanceTradeTracker {
     #[new]
     pub fn new() -> Self {
         Self {
-            history: VecDeque::with_capacity(4096),
+            history: VecDeque::with_capacity(3600),
             last_price: None,
             last_ts: None,
         }
     }
 
     pub fn record_trade(&mut self, price: f64, timestamp_s: f64) {
-        self.record_trade_flow(price, 0.0, false, timestamp_s);
-    }
-
-    pub fn record_trade_flow(&mut self, price: f64, qty: f64, is_buyer_maker: bool, timestamp_s: f64) {
         self.last_price = Some(price);
         self.last_ts = Some(timestamp_s);
-        let qty_usd = (price * qty).max(0.0);
-        let is_aggressor_buy = !is_buyer_maker;
-        self.history.push_back((timestamp_s, price, qty_usd, is_aggressor_buy));
+        self.history.push_back((timestamp_s, price));
 
         let cutoff = timestamp_s - 60.0;
-        while let Some(&(ts, _, _, _)) = self.history.front() {
+        while let Some(&(ts, _)) = self.history.front() {
             if ts < cutoff {
                 self.history.pop_front();
             } else {
@@ -866,78 +775,13 @@ impl BinanceTradeTracker {
         };
         let target_ts = last_ts - lookback_s;
         let mut past_price = self.history.front().map(|x| x.1).unwrap_or(current_price);
-        for &(ts, px, _, _) in self.history.iter() {
+        for &(ts, px) in self.history.iter() {
             if ts >= target_ts {
                 past_price = px;
                 break;
             }
         }
         current_price - past_price
-    }
-
-    #[pyo3(signature = (fast_s=4.0, slow_s=12.0, extreme_s=30.0))]
-    pub fn get_flow_metrics<'py>(
-        &self,
-        py: Python<'py>,
-        fast_s: f64,
-        slow_s: f64,
-        extreme_s: f64,
-    ) -> PyResult<PyObject> {
-        let dict = PyDict::new_bound(py);
-        let (current_price, last_ts) = match (self.last_price, self.last_ts) {
-            (Some(p), Some(ts)) => (p, ts),
-            _ => return Ok(py.None()),
-        };
-
-        let fast_cutoff = last_ts - fast_s;
-        let slow_cutoff = last_ts - slow_s;
-        let extreme_cutoff = last_ts - extreme_s;
-
-        let mut fast_past: Option<f64> = None;
-        let mut slow_past: Option<f64> = None;
-        let mut min_px = current_price;
-        let mut max_px = current_price;
-        let mut buy_vol_usd = 0.0_f64;
-        let mut sell_vol_usd = 0.0_f64;
-
-        for &(ts, px, q_usd, is_buy) in self.history.iter() {
-            if ts >= extreme_cutoff {
-                if px < min_px { min_px = px; }
-                if px > max_px { max_px = px; }
-            }
-            if slow_past.is_none() && ts >= slow_cutoff {
-                slow_past = Some(px);
-            }
-            if fast_past.is_none() && ts >= fast_cutoff {
-                fast_past = Some(px);
-            }
-            if ts >= slow_cutoff && q_usd > 0.0 {
-                if is_buy {
-                    buy_vol_usd += q_usd;
-                } else {
-                    sell_vol_usd += q_usd;
-                }
-            }
-        }
-
-        let fallback_px = self.history.front().map(|x| x.1).unwrap_or(current_price);
-        let mom_fast = current_price - fast_past.unwrap_or(fallback_px);
-        let mom_slow = current_price - slow_past.unwrap_or(fallback_px);
-        let total_vol = buy_vol_usd + sell_vol_usd;
-        let flow_imbalance = if total_vol > 0.0 {
-            (buy_vol_usd - sell_vol_usd) / total_vol
-        } else {
-            0.0
-        };
-
-        dict.set_item("mom_fast", mom_fast)?;
-        dict.set_item("mom_slow", mom_slow)?;
-        dict.set_item("buy_vol_usd", buy_vol_usd)?;
-        dict.set_item("sell_vol_usd", sell_vol_usd)?;
-        dict.set_item("flow_imbalance", flow_imbalance)?;
-        dict.set_item("bounce_from_low", (current_price - min_px).max(0.0))?;
-        dict.set_item("drop_from_high", (max_px - current_price).max(0.0))?;
-        Ok(dict.into())
     }
 
     pub fn clear(&mut self) {
@@ -1218,9 +1062,7 @@ fn rust_clob(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // High-performance data handling & math accelerators
     m.add_function(wrap_pyfunction!(compute_fair_prob, m)?)?;
     m.add_function(wrap_pyfunction!(compute_realized_drift_vol, m)?)?;
-    m.add_function(wrap_pyfunction!(compute_ewma_vol, m)?)?;
     m.add_function(wrap_pyfunction!(fast_parse_binance_trade, m)?)?;
-    m.add_function(wrap_pyfunction!(fast_parse_binance_trade_flow, m)?)?;
     m.add_function(wrap_pyfunction!(fast_walk_asks, m)?)?;
     m.add_function(wrap_pyfunction!(fast_walk_bids, m)?)?;
 

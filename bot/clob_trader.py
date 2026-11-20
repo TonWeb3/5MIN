@@ -510,7 +510,6 @@ class ClobTrader:
         order_type_str: str,
         expiration_str: str = "0",
         neg_risk: bool = False,
-        post_only: bool = False,
     ) -> Dict[str, Any]:
         """Sign EIP-712 / Solady ERC-1271 order and POST via native Rust (`rust_clob`),
         releasing the GIL during network I/O."""
@@ -523,7 +522,7 @@ class ClobTrader:
             str(order_type_str),
             str(expiration_str),
             bool(neg_risk),
-            bool(post_only),
+            False,
             False,
         )
         http_status = int(res.get("http_status") or 0)
@@ -600,12 +599,12 @@ class ClobTrader:
         order_type=None,
         neg_risk: Optional[bool] = None,
         tick_size: Optional[str] = None,
-        post_only: bool = False,
     ) -> Dict[str, Any]:
+        from polymarket_apis.types.clob_types import OrderType
         from polymarket_apis.utilities.order_builder.builder import ROUNDING_CONFIG
 
-        ot_raw = order_type if order_type is not None else getattr(settings, "CLOB_ORDER_TYPE", "FAK")
-        ot_str = str(ot_raw.value if hasattr(ot_raw, "value") else ot_raw).upper()
+        ot = order_type if order_type is not None else OrderType.FOK
+        ot_str = str(ot.value if hasattr(ot, "value") else ot)
 
         resolved_tick, resolved_neg_risk = self._resolve_market_meta(token_id, tick_size=tick_size, neg_risk=neg_risk)
         round_cfg = ROUNDING_CONFIG.get(resolved_tick) or ROUNDING_CONFIG["0.01"]
@@ -639,7 +638,6 @@ class ClobTrader:
             order_type_str=ot_str,
             expiration_str="0",
             neg_risk=resolved_neg_risk,
-            post_only=bool(post_only),
         )
 
         order_id = None
@@ -711,10 +709,8 @@ class ClobTrader:
         price: Optional[float] = None,
         neg_risk: Optional[bool] = None,
         tick_size: Optional[str] = None,
-        order_type: Optional[str] = None,
-        post_only: Optional[bool] = None,
     ) -> Dict[str, Any]:
-        """Slippage-capped BUY for `usdc_amount` USDC of `token_id` (uses CLOB_ORDER_TYPE / CLOB_POST_ONLY)."""
+        """Fill-Or-Kill marketable BUY for `usdc_amount` USDC of `token_id`."""
         if not token_id:
             return {"ok": False, "error": "missing_token_id"}
         if not price or price <= 0:
@@ -728,11 +724,8 @@ class ClobTrader:
             resolved_tick, _ = self._resolve_market_meta(token_id, tick_size=tick_size, neg_risk=neg_risk)
             tick_f = float(resolved_tick)
             limit = min(1.0 - tick_f, max(float(price), float(price) + settings.CLOB_MAX_SLIPPAGE))
-            ot = order_type if order_type is not None else getattr(settings, "CLOB_ORDER_TYPE", "FAK")
-            po = bool(getattr(settings, "CLOB_POST_ONLY", False) if post_only is None else post_only)
             return self._market_order(token_id, usdc_amount, "BUY", limit,
-                                      order_type=ot, neg_risk=neg_risk,
-                                      tick_size=resolved_tick, post_only=po)
+                                      neg_risk=neg_risk, tick_size=resolved_tick)
         except Exception as e:
             return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
@@ -743,10 +736,8 @@ class ClobTrader:
         price: Optional[float] = None,
         neg_risk: Optional[bool] = None,
         tick_size: Optional[str] = None,
-        order_type: str = "FAK",
-        post_only: bool = False,
     ) -> Dict[str, Any]:
-        """Fill-And-Kill marketable SELL of `size` shares (used to exit / flip / free-roll / trailing / tp / sl)."""
+        """Fill-Or-Kill marketable SELL of `size` shares (used to exit / flip / tp / sl)."""
         if not token_id:
             return {"ok": False, "error": "missing_token_id"}
         if not price or price <= 0:
@@ -763,8 +754,7 @@ class ClobTrader:
             tick_f = float(resolved_tick)
             limit = max(tick_f, min(float(price), float(price) - settings.CLOB_MAX_SLIPPAGE))
             return self._market_order(token_id, size, "SELL", limit,
-                                      order_type=order_type, neg_risk=neg_risk,
-                                      tick_size=resolved_tick, post_only=bool(post_only))
+                                      neg_risk=neg_risk, tick_size=resolved_tick)
         except Exception as e:
             return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
