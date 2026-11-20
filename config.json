@@ -1,0 +1,90 @@
+{
+  "mode": "paper",
+  "paper_balance_usd": 1000.0,
+  "private_key": "",
+  "relayer": {
+    "api_key": ""
+  },
+  "capital_extractor": {
+    "enabled": false,
+    "trigger_balance": 2000,
+    "withdraw_amount": 1000,
+    "withdraw_address": "",
+    "auto_resume_after_withdrawal": true,
+    "resume_after": "submitted"
+  },
+  "polymarket": {
+    "gamma_base_url": "https://gamma-api.polymarket.com",
+    "clob_base_url": "https://clob.polymarket.com",
+    "live_ws_url": "wss://ws-live-data.polymarket.com",
+    "series_id": "10684",
+    "series_slug": "btc-up-or-down-5m",
+    "auto_select_latest": true,
+    "up_label": "Up",
+    "down_label": "Down"
+  },
+  "trading": {
+    "symbol": "BTCUSDT",
+    "binance_base_url": "https://api.binance.com",
+    "candle_window_minutes": 5,
+    "poll_interval_ms": 500,
+    "event_min_interval_ms": 25,
+    "vol_ewma_half_life": 15.0,
+    "clob_order_type": "FAK",
+    "clob_post_only": true,
+    "max_entry_slippage": 0.015,
+    "risk_type": "percent",
+    "risk_value": 10,
+    "max_spot_age_s": 5,
+    "max_book_age_s": 15,
+    "max_settle_price_age_s": 30,
+    "auto_redeem": true
+  },
+  "underdog": {
+    "max_price": 0.07,
+    "min_prob": 0.1,
+    "min_ev": 0.02,
+    "max_sigma_distance": 2.0,
+    "min_time_left_min": 0.75,
+    "max_time_left_min": 3.5,
+    "momentum_filter": true,
+    "momentum_lookback_s": 10.0,
+    "momentum_fast_s": 4.0,
+    "momentum_slow_s": 12.0,
+    "min_bounce_sigma": 0.15,
+    "min_flow_imbalance": 0.1,
+    "min_book_liquidity_usd": 20
+  },
+  "flip": {
+    "enabled": false,
+    "min_conviction": 0.55,
+    "min_minutes_left": 1.5
+  },
+  "tp_sl": {
+    "enabled": true,
+    "take_profit_cents": 25,
+    "stop_loss_pct": 50,
+    "stop_loss_grace_s": 15,
+    "free_roll_enabled": true,
+    "free_roll_mult": 2.5,
+    "free_roll_min_cents": 12,
+    "free_roll_sell_frac": 0.5,
+    "trailing_stop_enabled": true,
+    "trailing_activate_cents": 15,
+    "trailing_drop_cents": 4
+  },
+  "price_stream": {
+    "enabled": true,
+    "prices": true,
+    "settle": true,
+    "chance": true,
+    "sd_floor_usd": 3.0,
+    "pick_tolerance_s": 2.0
+  },
+  "chainlink": {
+    "polygon_rpc_url": "https://polygon.drpc.org",
+    "polygon_wss_url": "wss://polygon-bor-rpc.publicnode.com",
+    "btc_usd_aggregator": "0xc907E116054Ad103354f2D350FD2514433D57F6f",
+    "alchemy_api_key": "DfkvQ854X-Kg4-ytU2sG0"
+  }
+}
